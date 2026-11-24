@@ -1,0 +1,36 @@
+# Flow SMSP script-backed backup/restore — site config
+# Installed to: /home/nutanix/flow_br/flow_br.conf
+# Written by install.sh; edit and re-run: flow-br backup --now
+
+# Required: backup host reachable over SSH from the PCVM
+# Quote values that contain spaces or shell metacharacters.
+BACKUP_HOST=''
+BACKUP_USER='nutanix'
+BACKUP_PATH='~/flow_backups'
+
+# SSH trust (created by install.sh)
+SSH_KEY='/home/nutanix/.ssh/flow_br_backup'
+KNOWN_HOSTS='/home/nutanix/flow_br/known_hosts'
+
+# Interpreter and script paths
+PYTHON='/home/nutanix/.venvs/bin/bin/python3'
+FLOW_BR_SCRIPT='/home/nutanix/flow_br/flow_br_poc.py'
+
+# Periodic backup (systemd timer OnCalendar; see systemd/flow-br-backup.timer)
+# Hourly examples:
+#   every 1h  -> hourly
+#   every 6h  -> *-*-* 0/6:00:00
+# Daily example:
+#   02:30 UTC -> *-*-* 02:30:00
+BACKUP_ONCALENDAR='*-*-* 0/6:00:00'
+BACKUP_INTERVAL_HOURS='6'
+BACKUP_RANDOMIZED_DELAY_SEC='300'
+
+# Optional: keep N newest archives on the backup host after each backup (0=disable)
+BACKUP_RETAIN_COUNT='28'
+
+# Timer-run prechecks (skipped for: flow-br backup --now). 1=on, 0=off.
+# Scale-out PC: only the lowest-IP PCVM (from svmips) runs scheduled backups.
+BACKUP_LEADER_CHECK='1'
+# Skip (exit 0) when insights_server is not running, e.g. during cluster stop.
+BACKUP_REQUIRE_CLUSTER_UP='1'

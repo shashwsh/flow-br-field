@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodic Flow SMSP backup timer
+
+[Timer]
+# Substituted by install.sh from flow_br.conf
+OnCalendar=@BACKUP_ONCALENDAR@
+Persistent=true
+RandomizedDelaySec=@BACKUP_RANDOMIZED_DELAY_SEC@
+Unit=flow-br-backup.service
+
+[Install]
+WantedBy=timers.target

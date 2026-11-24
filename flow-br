@@ -1,0 +1,417 @@
+#!/usr/bin/env bash
+# Disclaimer: Usage of this tool must be under the guidance of Nutanix Support or an authorized partner
+# Summary: Operator CLI wrapper for Flow SMSP field backup/restore/cleanup (reads flow_br.conf)
+# Version of the script: 1.0
+# Compatible software version(s): Prism Central with Flow SMSP (confirm target PC/Flow versions before use)
+# Brief syntax usage: flow-br {status|backup|cleanup|restore|recover-help} [options]
+# Caveats: Requires prior install.sh. Backup is scheduled via systemd timer; cleanup/restore are manual.
+#   Must use matching SSH private key and pinned known_hosts. Not for unattended disaster recovery.
+set -euo pipefail
+
+FLOW_BR_HOME="${FLOW_BR_HOME:-/home/nutanix/flow_br}"
+CONF="${FLOW_BR_CONF:-$FLOW_BR_HOME/flow_br.conf}"
+LOCK_FILE="${FLOW_BR_LOCK:-/home/nutanix/flow_br/backup.lock}"
+LOG_DIR="${FLOW_BR_LOG_DIR:-/home/nutanix/flow_br/logs}"
+UNIT_DIR="/etc/systemd/system"
+
+die() { echo "flow-br: $*" >&2; exit 1; }
+
+load_conf() {
+  [[ -f "$CONF" ]] || die "missing $CONF — run install.sh first"
+  # shellcheck disable=SC1090
+  set -a
+  # shellcheck source=/dev/null
+  . "$CONF"
+  set +a
+  [[ -n "${BACKUP_HOST:-}" ]] || die "BACKUP_HOST is empty in $CONF"
+  [[ -x "${PYTHON:-}" ]] || die "PYTHON not executable: ${PYTHON:-unset}"
+  [[ -f "${FLOW_BR_SCRIPT:-}" ]] || die "script not found: ${FLOW_BR_SCRIPT:-unset}"
+  [[ -f "${SSH_KEY:-}" ]] || die "ssh key missing: ${SSH_KEY:-unset}"
+  [[ -f "${KNOWN_HOSTS:-}" ]] || die "known_hosts missing: ${KNOWN_HOSTS:-unset}"
+}
+
+ssh_opts() {
+  echo --scp-host "$BACKUP_HOST" \
+       --scp-user "${BACKUP_USER:-nutanix}" \
+       --scp-path "${BACKUP_PATH:-~/flow_backups}" \
+       --ssh-key "$SSH_KEY" \
+       --known-hosts "$KNOWN_HOSTS"
+}
+
+# Remote shell snippet: resolve BACKUP_PATH with remote ~ / $HOME.
+remote_dir_expr() {
+  local p="${BACKUP_PATH:-~/flow_backups}"
+  if [[ "$p" == "~" ]]; then
+    echo '"$HOME"'
+  elif [[ "$p" == '~/'* ]]; then
+    printf '"$HOME"/%q' "${p#'~/'}"
+  else
+    printf '%q' "$p"
+  fi
+}
+
+ssh_backup_host() {
+  ssh -F /dev/null -i "$SSH_KEY" -o IdentitiesOnly=yes -o BatchMode=yes \
+      -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$KNOWN_HOSTS" \
+      -o ConnectTimeout=20 -o LogLevel=ERROR \
+      "${BACKUP_USER}@${BACKUP_HOST}" "$@"
+}
+
+run_py() {
+  # Global flags must come before the subcommand (see QUICKSTART).
+  local globals=()
+  while [[ $# -gt 0 && "$1" == --* ]]; do
+    case "$1" in
+      --smsp-uuid|--idf-ip|--idf-port|--zk-host-port)
+        globals+=("$1" "$2"); shift 2 ;;
+      *) break ;;
+    esac
+  done
+  "$PYTHON" "$FLOW_BR_SCRIPT" "${globals[@]}" "$@"
+}
+
+cmd_status() {
+  load_conf
+  echo "config:        $CONF"
+  echo "backup host:   ${BACKUP_USER}@${BACKUP_HOST}:${BACKUP_PATH}"
+  echo "ssh key:       $SSH_KEY"
+  echo "script:        $FLOW_BR_SCRIPT"
+  echo "schedule:      ${BACKUP_ONCALENDAR:-unset}"
+  echo "backup node:   ${BACKUP_NODE_IP:-unset} (this PCVM: $(local_ip || echo unknown))"
+  echo
+  # Refresh next_fire from live systemd so status never shows a past elapse.
+  if timer_healthy; then
+    write_timer_heartbeat 1 refreshed
+  elif [[ -f "$UNIT_DIR/flow-br-backup.timer" ]]; then
+    write_timer_heartbeat 0 "timer not active"
+  fi
+  echo "status in PC ZK (read by atlas for alerts):"
+  run_py zk-status || echo "(PC ZK unreadable)"
+  echo
+  if timer_healthy; then
+    systemctl status flow-br-backup.timer --no-pager -l || true
+  else
+    echo
+    echo "!!! WARNING: flow-br-backup.timer is missing, disabled or inactive."
+    echo "!!! Scheduled backups are NOT running (expected after a PC upgrade)."
+    echo "!!! Fix: flow-br ensure-timer"
+  fi
+  echo
+  echo "newest remote archive:"
+  ssh_backup_host \
+      "dir=$(remote_dir_expr); ls -1t \"\$dir\"/flow_backup_*.tar.gz 2>/dev/null | head -3" \
+    || echo "(none / unreachable)"
+}
+
+retain_remote() {
+  local n="${BACKUP_RETAIN_COUNT:-0}"
+  [[ "$n" =~ ^[0-9]+$ ]] && [[ "$n" -gt 0 ]] || return 0
+  # Keep newest N tar.gz (+ matching .sha256); delete older ones.
+  ssh_backup_host bash -s <<EOF
+set -euo pipefail
+dir=$(remote_dir_expr)
+cd "\$dir" || exit 0
+mapfile -t files < <(ls -1t flow_backup_*.tar.gz 2>/dev/null || true)
+if (( \${#files[@]} > $n )); then
+  for f in "\${files[@]:$n}"; do
+    rm -f "\$f" "\$f.sha256"
+    echo "retained: removed \$f"
+  done
+fi
+EOF
+}
+
+timer_healthy() {
+  [[ -f "$UNIT_DIR/flow-br-backup.timer" && -f "$UNIT_DIR/flow-br-backup.service" ]] \
+    && systemctl is-enabled flow-br-backup.timer &>/dev/null \
+    && systemctl is-active flow-br-backup.timer &>/dev/null
+}
+
+# This PCVM's cluster IP: the svmips entry that is configured on a local NIC.
+# Non-login shells (and Atlas) often lack /usr/local/nutanix/cluster/bin on PATH.
+local_ip() {
+  local svmips_bin ip
+  svmips_bin="$(command -v svmips 2>/dev/null || true)"
+  [[ -z "$svmips_bin" && -x /usr/local/nutanix/cluster/bin/svmips ]] \
+    && svmips_bin=/usr/local/nutanix/cluster/bin/svmips
+  [[ -n "$svmips_bin" ]] || return 1
+  for ip in $("$svmips_bin" 2>/dev/null); do
+    if hostname -I | tr ' ' '\n' | grep -qxF "$ip"; then
+      echo "$ip"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Best effort: atlas raises FlowControllerBackupNotRunning from these heartbeats.
+write_timer_heartbeat() {
+  local healthy="$1" detail="$2" ip next_usecs
+  ip="$(local_ip)" || return 0
+  [[ -x "${PYTHON:-}" && -f "${FLOW_BR_SCRIPT:-}" ]] || return 0
+  # systemd 252 on PC ignores --timestamp=unix and prints e.g.
+  # "Tue 2026-11-24 00:03:40 GMT"; older builds print "@<secs>".
+  local next_raw next_secs=""
+  next_raw="$(systemctl show flow-br-backup.timer \
+                -p NextElapseUSecRealtime --value 2>/dev/null || true)"
+  if [[ "$next_raw" =~ ^@([0-9]+) ]]; then
+    next_secs="${BASH_REMATCH[1]}"
+  elif [[ -n "$next_raw" && "$next_raw" != infinity && "$next_raw" != n/a ]]; then
+    next_secs="$(date -u -d "$next_raw" +%s 2>/dev/null || true)"
+  fi
+  local args=(zk-timer --node-ip "$ip" --detail "$detail")
+  [[ "$healthy" == 1 ]] && args+=(--healthy)
+  [[ -n "$next_secs" ]] && args+=(--next-fire-usecs "$((next_secs * 1000000))")
+  run_py "${args[@]}" >/dev/null 2>&1 \
+    || echo "flow-br: WARN could not write timer heartbeat to PC ZK" >&2
+}
+
+timer_fail() {
+  write_timer_heartbeat 0 "$*"
+  die "$*"
+}
+
+# Idempotent: re-registers units from $FLOW_BR_HOME/systemd (survives PC upgrade)
+# into /etc/systemd/system (replaced on PC upgrade). Atlas runs this on every
+# PCVM at startup and hourly while backups are enabled in PC ZK.
+cmd_ensure_timer() {
+  local quiet=0
+  [[ "${1:-}" == --quiet ]] && quiet=1
+  if [[ -f "$CONF" ]]; then
+    set -a
+    # shellcheck source=/dev/null
+    . "$CONF"
+    set +a
+  fi
+  local src="$FLOW_BR_HOME/systemd" changed=0 u
+  for u in flow-br-backup.service flow-br-backup.timer; do
+    [[ -f "$src/$u" ]] || timer_fail "missing $src/$u — re-run install.sh"
+    if ! cmp -s "$src/$u" "$UNIT_DIR/$u"; then
+      sudo -n install -m 0644 "$src/$u" "$UNIT_DIR/$u" \
+        || timer_fail "cannot write $UNIT_DIR/$u (needs passwordless sudo)"
+      changed=1
+    fi
+  done
+  if [[ "$changed" -eq 1 ]]; then
+    sudo -n systemctl daemon-reload || timer_fail "systemctl daemon-reload failed"
+  fi
+  if ! timer_healthy; then
+    sudo -n systemctl enable --now flow-br-backup.timer \
+      || timer_fail "cannot enable flow-br-backup.timer"
+    changed=1
+  fi
+  timer_healthy || timer_fail "flow-br-backup.timer not active after enable"
+  write_timer_heartbeat 1 "$([[ "$changed" -eq 1 ]] && echo rearmed || echo ok)"
+  if [[ "$quiet" -eq 0 ]]; then
+    [[ "$changed" -eq 1 ]] && echo "flow-br: timer (re)installed and enabled" \
+                           || echo "flow-br: timer already installed and enabled"
+    systemctl list-timers flow-br-backup.timer --no-pager || true
+  fi
+}
+
+# Exit 0 (skip, not fail) so a down cluster does not mark the unit failed.
+skip_backup() {
+  echo "flow-br: SKIP backup — $*"
+  exit 0
+}
+
+precheck_backup() {
+  # Scale-out PC: the timer runs on every PCVM; only BACKUP_NODE_IP (recorded
+  # in PC ZK by install.sh, so atlas knows which node to expect) backs up.
+  if [[ "${BACKUP_LEADER_CHECK:-1}" == 1 ]]; then
+    local node me
+    node="${BACKUP_NODE_IP:-}"
+    me="$(local_ip || true)"
+    if [[ -z "$node" && -n "$me" ]]; then
+      # Legacy installs without BACKUP_NODE_IP: fall back to lowest cluster IP.
+      local svmips_bin
+      svmips_bin="$(command -v svmips 2>/dev/null || true)"
+      [[ -z "$svmips_bin" && -x /usr/local/nutanix/cluster/bin/svmips ]] \
+        && svmips_bin=/usr/local/nutanix/cluster/bin/svmips
+      [[ -n "$svmips_bin" ]] \
+        && node="$("$svmips_bin" 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9.]+$' | sort -V | head -1 || true)"
+    fi
+    if [[ -n "$node" && "$me" != "$node" ]]; then
+      skip_backup "not the designated backup node ($node)"
+    fi
+  fi
+  if [[ "${BACKUP_REQUIRE_CLUSTER_UP:-1}" == 1 ]] && command -v genesis &>/dev/null; then
+    local st
+    st="$(genesis status 2>/dev/null || true)"
+    if [[ -z "$st" ]] || ! grep -Eq '^\s*insights_server:\s*\[[0-9]' <<<"$st"; then
+      run_py zk-skip --reason "PC insights_server not running" >/dev/null 2>&1 || true
+      skip_backup "cluster services not up (insights_server not running)"
+    fi
+  fi
+}
+
+cmd_backup() {
+  load_conf
+  [[ "${MANUAL_RUN:-0}" == 1 ]] || precheck_backup
+  mkdir -p "$LOG_DIR"
+  local log="$LOG_DIR/backup-$(date -u +%Y%m%dT%H%M%SZ).log"
+  # Prevent overlapping backups (timer + manual).
+  exec 9>"$LOCK_FILE"
+  if ! flock -n 9; then
+    die "another backup is already running (lock $LOCK_FILE)"
+  fi
+  echo "flow-br: backup -> ${BACKUP_USER}@${BACKUP_HOST}:${BACKUP_PATH}"
+  echo "flow-br: log $log"
+  # shellcheck disable=SC2046
+  if run_py backup $(ssh_opts) "$@" 2>&1 | tee "$log"; then
+    retain_remote || echo "flow-br: WARN retention cleanup failed" >&2
+    # Advance next_fire in ZK so status does not keep the just-elapsed time.
+    write_timer_heartbeat 1 "after-backup"
+    echo "flow-br: backup OK"
+  else
+    write_timer_heartbeat 1 "after-backup-failed" || true
+    die "backup failed — see $log"
+  fi
+}
+
+confirm() {
+  local prompt="$1"
+  local reply
+  read -r -p "$prompt [y/N] " reply
+  [[ "$reply" == "y" || "$reply" == "Y" ]]
+}
+
+cmd_cleanup() {
+  load_conf
+  local apply=0 force=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --apply) apply=1; shift ;;
+      --force) force=(--force); shift ;;
+      -h|--help)
+        echo "usage: flow-br cleanup [--apply] [--force]"
+        echo "  dry-run by default; --apply executes force-retire"
+        exit 0 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  echo "flow-br: force-retire (PC leftovers for lost SMSP)"
+  echo "flow-br: ensure atlas is stopped (genesis stop atlas) before --apply"
+  if [[ "$apply" -eq 0 ]]; then
+    run_py force-retire
+    echo
+    echo "flow-br: review above, then: flow-br cleanup --apply"
+    return 0
+  fi
+  confirm "Apply force-retire on this PCVM?" || die "aborted"
+  run_py force-retire --apply "${force[@]}"
+  echo "flow-br: cleanup done — create the replacement SMSP, then: flow-br restore"
+}
+
+cmd_restore() {
+  load_conf
+  local dry=0 archive=() extra=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) dry=1; shift ;;
+      --archive)
+        [[ $# -ge 2 ]] || die "--archive needs a value"
+        archive=(--archive "$2"); shift 2 ;;
+      -h|--help)
+        echo "usage: flow-br restore [--dry-run] [--archive NAME] [extra restore flags...]"
+        exit 0 ;;
+      *) extra+=("$1"); shift ;;
+    esac
+  done
+  echo "flow-br: restore from ${BACKUP_USER}@${BACKUP_HOST}:${BACKUP_PATH}"
+  if [[ "$dry" -eq 1 ]]; then
+    # shellcheck disable=SC2046
+    run_py restore $(ssh_opts) --dry-run "${archive[@]}" "${extra[@]}"
+    return 0
+  fi
+  confirm "Restore newest/selected archive onto the current SMSP (writes ZK+IDF+replay)?" \
+    || die "aborted"
+  # shellcheck disable=SC2046
+  run_py restore $(ssh_opts) "${archive[@]}" "${extra[@]}"
+  echo "flow-br: restore finished — verify in PC UI / flow_cli (see QUICKSTART)"
+}
+
+cmd_disable() {
+  load_conf
+  confirm "Stop scheduled backups (atlas will raise FlowControllerBackupNotEnabled)?" \
+    || die "aborted"
+  # ZK first: otherwise atlas re-arms the timer within the hour.
+  run_py zk-disable || die "could not update PC ZK; timer left running"
+  sudo -n systemctl disable --now flow-br-backup.timer 2>/dev/null || true
+  echo "flow-br: disabled on this PCVM; on scale-out PC also run on the other PCVMs:"
+  echo "         sudo systemctl disable --now flow-br-backup.timer"
+  echo "flow-br: re-enable with ./install.sh"
+}
+
+cmd_recover_help() {
+  cat <<'EOF'
+Disaster recovery sequence (manual gates; not a daemon):
+
+  1. Confirm SMSP is lost
+  2. genesis stop atlas
+  3. flow-br cleanup          # dry-run
+  4. flow-br cleanup --apply
+  5. cluster start
+  6. Create replacement Flow SMSP (normal product create)
+  7. Wait until SMSP healthy (iKat IDF :2027 open)
+  8. flow-br restore --dry-run
+  9. flow-br restore
+ 10. Verify policies / VPC / ports
+ 11. flow-br backup --now    # fresh post-restore backup
+
+Config (backup host etc.) comes from:
+  /home/nutanix/flow_br/flow_br.conf
+EOF
+}
+
+usage() {
+  cat <<'EOF'
+usage: flow-br <command> [options]
+
+commands:
+  status              show config, timer, newest remote archives
+  backup [--now]      run one backup using flow_br.conf (also used by systemd)
+  cleanup             force-retire dry-run / --apply [--force]
+  restore             restore from backup host (--dry-run, --archive NAME)
+  recover-help        print disaster recovery sequence
+  ensure-timer        (re)install + enable the systemd timer (atlas does this
+                      automatically after a PC upgrade)
+  disable             stop scheduled backups and mark them disabled in PC ZK
+
+install / schedule:
+  ./install.sh        one-time site setup (writes conf, key, timer)
+
+after a PC upgrade (root filesystem is replaced; /home is kept):
+  flow-br status      warns if the timer is gone
+  flow-br ensure-timer
+EOF
+}
+
+main() {
+  local cmd="${1:-}"
+  shift || true
+  case "$cmd" in
+    status) cmd_status "$@" ;;
+    backup|--now)
+      # allow: flow-br backup | flow-br backup --now | flow-br --now
+      # --now = operator run: skip leader/cluster prechecks used by the timer.
+      if [[ "$cmd" == --now ]]; then
+        MANUAL_RUN=1 cmd_backup "$@"
+      elif [[ "${1:-}" == --now ]]; then
+        shift
+        MANUAL_RUN=1 cmd_backup "$@"
+      else
+        cmd_backup "$@"
+      fi
+      ;;
+    cleanup) cmd_cleanup "$@" ;;
+    restore) cmd_restore "$@" ;;
+    recover-help) cmd_recover_help ;;
+    ensure-timer) cmd_ensure_timer "$@" ;;
+    disable) cmd_disable ;;
+    -h|--help|help|"") usage ;;
+    *) die "unknown command: $cmd (try: flow-br --help)" ;;
+  esac
+}
+
+main "$@"

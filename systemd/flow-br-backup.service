@@ -1,0 +1,23 @@
+[Unit]
+Description=Flow SMSP script-backed backup (oneshot)
+Documentation=file:///home/nutanix/flow_br/flow_br.conf
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=nutanix
+Group=nutanix
+# Oneshot: runs once per timer fire, then exits. Not a long-running daemon.
+# Run via bash: SELinux (Enforcing on PCVM) denies systemd exec of user_home_t files.
+ExecStart=/bin/bash /home/nutanix/flow_br/flow-br backup
+# A hung backup is killed; atlas alerts on a RUNNING status older than this + 30m.
+TimeoutStartSec=2h
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+# Make failures visible in journalctl -u flow-br-backup.service
+StandardOutput=journal
+StandardError=journal
+# No [Install] section: only flow-br-backup.timer is enabled; never enable this unit directly.
